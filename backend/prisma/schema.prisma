@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Host {
+  id                  String         @id @default(uuid())
+  username            String         @unique
+  passwordHash        String
+  failedLoginAttempts Int            @default(0)
+  lockoutUntil        DateTime?
+  presentations       Presentation[]
+  sessions            Session[]
+  activityLogs        ActivityLog[]
+  refreshTokens       RefreshToken[]
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  hostId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  revoked   Boolean  @default(false)
+
+  host Host @relation(fields: [hostId], references: [id], onDelete: Cascade)
+}
+
+model Presentation {
+  id               String    @id @default(uuid())
+  hostId           String
+  title            String
+  originalFilename String
+  filePath         String
+  thumbnailPath    String?
+  slideCount       Int       @default(0)
+  notes            Json?
+  uploadTimestamp  DateTime  @default(now())
+  updatedTimestamp DateTime  @updatedAt
+
+  host     Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  sessions Session[]
+}
+
+model Session {
+  id             String    @id @default(uuid())
+  sessionCode    String    @unique
+  hostId         String
+  presentationId String
+  currentSlide   Int       @default(1)
+  startedTime    DateTime  @default(now())
+  endedTime      DateTime?
+  viewerCount    Int       @default(0)
+  isActive       Boolean   @default(true)
+  isBlackout     Boolean   @default(false)
+
+  host              Host               @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  presentation      Presentation       @relation(fields: [presentationId], references: [id], onDelete: Cascade)
+  settings          SessionSettings?
+  viewerConnections ViewerConnection[]
+}
+
+model SessionSettings {
+  id                 String    @id @default(uuid())
+  sessionId          String    @unique
+  allowManualReading Boolean   @default(true)
+  enableDownload     Boolean   @default(false)
+  enableViewerCount  Boolean   @default(true)
+  allowFullscreen    Boolean   @default(true)
+  autoSync           Boolean   @default(true)
+  theme              String    @default("dark")
+  defaultZoom        Int       @default(100)
+  sessionExpiration  DateTime?
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+model ViewerConnection {
+  id        String   @id @default(uuid())
+  sessionId String
+  joinTime  DateTime @default(now())
+  lastSeen  DateTime @updatedAt
+  isOnline  Boolean  @default(true)
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+model ActivityLog {
+  id        String   @id @default(uuid())
+  hostId    String
+  action    String
+  timestamp DateTime @default(now())
+
+  host Host @relation(fields: [hostId], references: [id], onDelete: Cascade)
+}

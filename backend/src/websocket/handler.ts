@@ -1,0 +1,181 @@
+import { WebSocketServer, WebSocket } from 'ws';
+import { Server } from 'http';
+import prisma from '../prisma/client';
+
+function parseCookieHeader(header: string): Record<string, string> {
+  return header.split(';').reduce<Record<string, string>>((result, part) => {
+    const trimmed = part.trim();
+    if (!trimmed) return result;
+    const index = trimmed.indexOf('=');
+    if (index === -1) return result;
+    const key = trimmed.slice(0, index);
+    const value = trimmed.slice(index + 1);
+    result[key] = decodeURIComponent(value);
+    return result;
+  }, {});
+}
+
+interface ExtWebSocket extends WebSocket {
+  isAlive: boolean;
+  role: 'host' | 'viewer';
+  sessionCode: string;
+  connectionId: string;
+}
+
+const wss = new WebSocketServer({ noServer: true });
+const rooms = new Map<string, Set<ExtWebSocket>>();
+
+export function setupWebSocket(server: Server) {
+  server.on('upgrade', (request, socket, head) => {
+    const url = new URL(request.url || '', `http://${request.headers.host}`);
+    if (url.pathname === '/ws') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+
+  wss.on('connection', (ws: ExtWebSocket, request) => {
+    ws.isAlive = true;
+    ws.on('pong', () => (ws.isAlive = true));
+
+    ws.on('message', async (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        
+        if (msg.type === 'join') {
+          ws.sessionCode = msg.sessionCode;
+          ws.connectionId = msg.connectionId || 'unknown';
+          
+          if (msg.role === 'host') {
+            const cookieHeader = request.headers.cookie || '';
+            const cookies = parseCookieHeader(cookieHeader);
+            const token = cookies.accessToken;
+            
+            if (!token) {
+              ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized: No token' }));
+              ws.close(4001, 'Unauthorized');
+              return;
+            }
+            
+            const { verifyAccessToken } = await import('../services/jwt');
+            const payload = verifyAccessToken(token);
+            if (!payload || payload.role !== 'host') {
+              ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized: Invalid token' }));
+              ws.close(4001, 'Unauthorized');
+              return;
+            }
+
+            const session = await prisma.session.findUnique({
+              where: { sessionCode: msg.sessionCode },
+              select: { hostId: true },
+            });
+
+            if (!session || session.hostId !== payload.hostId) {
+              ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized: Session ownership mismatch' }));
+              ws.close(4001, 'Unauthorized');
+              return;
+            }
+
+            ws.role = 'host';
+          } else {
+            ws.role = 'viewer';
+          }
+
+          if (!rooms.has(ws.sessionCode)) {
+            rooms.set(ws.sessionCode, new Set());
+          }
+          rooms.get(ws.sessionCode)!.add(ws);
+
+          if (ws.role === 'viewer') {
+            await updateViewerCount(ws.sessionCode, 1);
+          }
+        } 
+        else if (msg.type === 'slide_change' && ws.role === 'host') {
+          await prisma.session.update({
+            where: { sessionCode: ws.sessionCode },
+            data: { currentSlide: msg.slide },
+          });
+          broadcastToRoom(ws.sessionCode, { type: 'slide_changed', slide: msg.slide });
+        }
+        else if (msg.type === 'broadcast' && ws.role === 'host') {
+          broadcastToRoom(ws.sessionCode, { type: 'broadcast', message: msg.message });
+        }
+        else if (msg.type === 'blackout' && ws.role === 'host') {
+          await prisma.session.update({
+            where: { sessionCode: ws.sessionCode },
+            data: { isBlackout: msg.isBlackout },
+          });
+          broadcastToRoom(ws.sessionCode, { type: 'blackout', isBlackout: msg.isBlackout });
+        }
+        else if (msg.type === 'settings_updated' && ws.role === 'host') {
+          broadcastToRoom(ws.sessionCode, { type: 'settings_updated', settings: msg.settings });
+        }
+        else if (msg.type === 'session_code_changed' && ws.role === 'host') {
+          broadcastToRoom(ws.sessionCode, { type: 'session_code_changed', newCode: msg.newCode });
+          
+          // Re-map the host to the new room, since the code changed
+          const oldRoom = rooms.get(ws.sessionCode);
+          if (oldRoom) {
+            oldRoom.delete(ws);
+          }
+          ws.sessionCode = msg.newCode;
+          if (!rooms.has(ws.sessionCode)) {
+            rooms.set(ws.sessionCode, new Set());
+          }
+          rooms.get(ws.sessionCode)!.add(ws);
+        }
+      } catch (err) {
+        console.error('WS Error:', err);
+      }
+    });
+
+    ws.on('close', async () => {
+      if (ws.sessionCode && rooms.has(ws.sessionCode)) {
+        rooms.get(ws.sessionCode)!.delete(ws);
+        if (ws.role === 'viewer') {
+          await updateViewerCount(ws.sessionCode, -1);
+        }
+      }
+    });
+  });
+
+  const interval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      const extWs = ws as ExtWebSocket;
+      if (!extWs.isAlive) return extWs.terminate();
+      extWs.isAlive = false;
+      extWs.ping();
+    });
+  }, 30000);
+
+  wss.on('close', () => clearInterval(interval));
+}
+
+async function updateViewerCount(sessionCode: string, change: number) {
+  try {
+    const session = await prisma.session.findUnique({ where: { sessionCode } });
+    if (!session) return;
+    const newCount = Math.max(0, session.viewerCount + change);
+    await prisma.session.update({
+      where: { sessionCode },
+      data: { viewerCount: newCount },
+    });
+    broadcastToRoom(sessionCode, { type: 'viewer_count', count: newCount });
+  } catch (error) {
+    console.error('Error updating viewer count:', error);
+  }
+}
+
+function broadcastToRoom(sessionCode: string, message: any) {
+  const room = rooms.get(sessionCode);
+  if (!room) return;
+  const msgStr = JSON.stringify(message);
+  for (const client of room) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msgStr);
+    }
+  }
+}
