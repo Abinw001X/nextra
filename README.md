@@ -4,7 +4,7 @@ Nexra is a live presentation platform for presenters who need a synchronized, br
 
 Developed and maintained by Abin Wilson.
 GitHub: https://github.com/Abinw001X
-Repository: https://github.com/Abinw001X/tax-assister
+Repository: https://github.com/Abinw001X/nextra
 
 ## Overview
 
@@ -168,7 +168,7 @@ No screenshots are committed to the repository in the current project state.
 - Developer name: Abin Wilson
 - GitHub username: Abinw001X
 - GitHub profile: https://github.com/Abinw001X
-- Repository: https://github.com/Abinw001X/tax-assister
+- Repository: https://github.com/Abinw001X/nextra
 
 ## License
 
